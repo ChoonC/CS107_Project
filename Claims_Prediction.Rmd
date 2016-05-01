@@ -1,0 +1,768 @@
+---
+title: "Claims Prediction"
+author: "Choon Cheng"
+date: "April 19, 2016"
+output: html_document
+---
+
+
+#Overview
+
+Claims management requires different levels of check before a claim can be approved and a payment can be made. In unexpected events, customers expect their insurer to 
+provide support as soon as possible. With the increasing needs and customer's expectation, BNP Paribas Cardiff offered a challenge in [Kaggle](https://www.kaggle.com/c/bnp-paribas-cardif-claims-management) to accelerate it's claims process.
+
+In the challenge, BNP Paribas Cardif provided an anonymized dataset with two categories of claims:
+i)	claims for which approval could be accelerated leading to faster payments
+ii)	claims for which additional information is required before approval
+The task is to predict the category of a claim based on features available early in the process.
+
+In this project, the main motivation is to firstly to explore and gain some insights from the dataset, and secondly to apply machine learning models to predict the outcome. The winner of the [competition] had a model accuracy of 0.42027. We evaluate internally within the training dataset provided and see where how we match up. 
+
+The evaluation metric is **Log Loss**
+
+$$logLoss =-\frac{1}{N}\sum_{i=1}^N (y_{i}logp_{i} + (1-y_{i})log(1-p_{i}))$$
+
+where N is the number of observations, log is the natural logarithm, $y_{i}$ is the binary target, and $p_{i}$ is the predicted probability that $y_{i}$ equals 1.
+
+#Data
+
+BNP provided two dataset - a training and test dataset for submission. We will only use the training dataset as the test dataset is used for the competition. The dataset contains both categorical and numeric variables available when the claims were received by BNP Paribas Cardif. All string type variables are categorical. There are no ordinal variables. The "target" variable in the training dataset is the variable to predict and is equal to 1 for claims suitable for an accelerated approval. 
+
+Read the dataset
+```{r, message=FALSE, warning=FALSE}
+library(vcd)
+library(readr)
+library(ggplot2)
+library(gridExtra)
+library(corrplot)
+library(dplyr)
+library(tidyr)
+library(mice)
+library(VIM)
+library(caret)
+theme_set(theme_bw(base_size = 20))
+
+write.csv(train, file=gzfile("train.csv.gz"), row.names=FALSE) 
+
+train <- read_csv("train.csv", na = c("", "NA"))
+
+filename <- "train.csv.gz"
+train <- read_csv(gzfile(filename), na = c("", "NA")) 
+
+#convert character variables to factor
+train[sapply(train, is.character)] <- lapply(train[sapply(train, is.character)], as.factor)
+```
+
+#Data Exploration and Wrangling
+```{r,  message=FALSE}
+dim(train)
+str(train)
+n_obs <- train %>% count(unique(ID)) %>% nrow()
+n_obs
+```
+There are 114,321 observations and 133 variables in the dataset. Apart from the variables "ID" and "target", all other variables/features (V1-V131) are anonymized meaning we don't know what the values represent. There are no duplicates ID in the dataset, each observation is a unique claim. 
+
+Typically with personal insurance claims data one would expect festures such as : policy number, customer ID, contract date, claims date, events date, product, subproduct, date of birth, address, processed date, lodged date, etc.. As the data is anonymized, it is unknown what has been provided and the process taken to anonymize the data. 
+
+```{r,  message=FALSE}
+table(train$target)
+prop.table(table(train$target))
+
+#count number of numeric features
+sum(sapply(train, is.numeric))
+
+#count number of categorical features
+sum(sapply(train, is.factor))
+
+#Create tables by data types for exploration, keep ID and target on both for sorting
+train_num <- train[,sapply(train, is.numeric)] %>% 
+              arrange(-target, ID) 
+train_fac <- bind_cols(select(train, c(ID, target)), 
+                       train[,sapply(train, is.factor)]) %>% 
+            arrange(-target, ID)
+
+```
+
+87,021 or 76.1% of the claims were classified as suitable for accelerated approval. 
+There are 112 numeric features in addition to the ID and target variables, and 19 categorical deatures 
+
+##Numeric features
+
+Four of the numeric features contains discreet values (v38, v62, v72, v129) which might suggest some kind of counts. All other variables are continuous.
+
+From the summary, we can see that a large number of the numeric features have missing values and most have values in the range 0 - 20. (v14 has 40 values in the order of -0.000001, which we regard as 0). 
+
+```{r}
+#summarise the features
+sapply(select(train_num, -ID),summary)
+
+# Look at the less than 0 values in v14
+select(train_num,v14) %>% 
+  filter(v14<0) %>% 
+  arrange(-v14)
+
+```
+
+Only 4 of the numeric features have no missing values (v38, v62, v72, v129). The majority (100) of the features have proportion of missing values between 42.5% and 44.5%. The rest of the features have less than 0.053% missing values. The proportion of missing values is slightly greater in claims which were accelerated (target=1) compared to those that require further information (target=0). 
+
+```{r}
+# Function to return a table of count and missing pct for all features
+getMissing <- function(tbl){
+    data.frame(feature.names = colnames(tbl), 
+               n_Miss=apply(tbl, 2, function(i){sum(is.na(i))}),
+               pct_Miss=apply(tbl, 2, function(i){sum(is.na(i))}/length(i))) %>% 
+    arrange(-n_Miss) 
+}
+
+#Overall missingness 
+missing_num <- getMissing(select(train_num, -ID))
+table(missing_num$n_Miss)
+
+#Missingness for target = 1
+missing_tgt1 <- getMissing(select(filter(train_num, target == 1), -ID)) 
+names(missing_tgt1) <- c("feature.names", "n_Miss_tgt1", "pct_Miss_tgt1")
+
+#Join the tables 
+missing_num <- missing_num %>% 
+  inner_join(missing_tgt1) 
+
+rm(missing_tgt1)
+
+```
+
+For the fetures with high proportion of missing values, the count of the observations with missing values takes on a fixed number of values. This is true also by the target group. This suggests that those groups of features tend to have missing values together regardless of the target and that they might be related to types of claims or product type.
+
+We use the *VIM* package to get a better understanding of the missing data. (ref:[r-bloggers imputing missing data with r  mice package](http://www.r-bloggers.com/imputing-missing-data-with-r-mice-package/)
+
+62.561 (55%) of the observations are complete in numeric values. 47,715 (42%) have missing values for the same group of features It confirms our suspicion that the same group of festures have missing values. There appears to be some patterns and clusters of observations. The pattern of missing values do not appear to be too different for the target = 1 group. The missing values are unlikely to be random but more likely to be related to be types of claims or products and questions asked regarding the claims.
+
+Due to the large proportion of features with missing values, excluding those observations or features would lead to loss of information. We impute the missing values for features where the proportion of missing values is less than 5%, namely v10,v12,v14,v21,v34,v40,v50 and v114. We then add an indicator to the dataset to indicate observations with no missing values and those with missing values. 
+
+```{r, fig.align="center", fig.height=8, fig.width=20, message=FALSE}
+tmp <- select(train_num, -c(ID, target))
+
+#Visualise missing data
+aggr(tmp, col=c('light blue','red'), numbers=TRUE, combined=TRUE, sortVars=TRUE, labels=names(tmp), cex.axis=.7, gap=3, ylab=c("Pattern of missing data"))
+
+#Target = 1
+tmp <- train_num %>% filter(target==1) %>% select(-c(ID, target))
+aggr(tmp, col=c('light blue','red'), numbers=TRUE, combined=TRUE, sortVars=TRUE, labels=names(tmp), cex.axis=.7, gap=3, ylab=c("Pattern of missing data target 1"))
+
+rm(tmp)
+     
+```
+
+###Distribution of the data
+
+The distribution of the numeric features are mostly either normally distributed or skewed. There are a few features with concave distribution and some features representing intervals (maybe time). The density plot of the variables suggest some features which might be predictive: v10,v14,v2,v34,v36,v40,v50,v58,v100,v106,v114,v98,v119,v123,v129
+
+```{r, fig.align="center", fig.height=12, fig.width=20, warning=FALSE}
+#Plot the  density by target
+plotDensity <- function(df){
+  d <- gather(df, key=variable, value=value, -target, na.rm = TRUE) %>%
+       mutate(target=as.character(target))
+  ggplot(d,aes(x = value, ..scaled..,fill=target)) + 
+    geom_density(alpha=0.4) + 
+    facet_wrap(~variable,scales = "free") 
+}
+
+select(train_num, 2,3:22) %>% plotDensity()
+select(train_num, 2,23:42) %>% plotDensity()
+select(train_num, 2,43:62) %>% plotDensity()
+select(train_num, 2,63:82) %>% plotDensity()
+select(train_num, 2,83:102) %>% plotDensity()
+select(train_num, 2,103:114) %>% plotDensity()
+
+```
+
+##Categorical Features
+
+One of the categorical feature (v22) have 18,210 levels and two variables with 90 and 122 levels.
+There are 8 categorical features with no missing values (v24, v47, v66, v71, v74, v75, v79, v110). Two features (v30, v113) with almost 50% missing values, and the rest of the categorical features with less than 6% missing values.
+
+From the visualisation, the proportion of missing value in v113 is greater in the target = 1 group. V3 and v31 have the same observations where their values are missing. They have the same number of categories but have different values.
+
+We looked at the combination of missing values between v30 and v113 and the numeric variables with high proportion of missing values. 19% of v30 had missing values together with the numeric variables, 17% of observations had missing values in v113 only, 12% missing in both v30 and v113, but not the numeric variables, 12% on both the categorical and the numeric features, 8.3% in v30 only and 6.5% on v113 and the numeric features. The missingness of either v30 or v113 do not indicate that the values for the numeric features are also missing.
+
+```{r, fig.align="center", fig.height=8, fig.width=20, message=FALSE}
+sapply(train_fac,summary)
+
+#Get the number of levels for each categorical features
+tmp <- train_fac %>% select(-c(ID, target))
+level<- sapply(tmp,function(x)nlevels(x))
+level
+
+#Overall missingness 
+missing_fac <- getMissing(tmp)
+table(missing_fac$n_Miss)
+
+#Missingnes for target = 1
+missing_tgt1 <- getMissing(select(filter(train_fac, target == 1), -ID)) 
+names(missing_tgt1) <- c("feature.names", "n_Miss_tgt1", "pct_Miss_tgt1")
+
+#Join the tables 
+missing_fac <- missing_fac %>% 
+  inner_join(missing_tgt1)
+
+#visualise the missing data 
+aggr(tmp, col=c('light blue','red'), numbers=TRUE, combined=TRUE, sortVars=TRUE, labels=names(tmp), cex.axis=.7, gap=3, ylab=c("Pattern of mising data"))
+
+#Target = 1
+tmp <- train_fac %>% filter(target==1) %>% select(-c(ID, target))
+aggr(tmp, col=c('light blue','red'), numbers=TRUE, combined=TRUE, sortVars=TRUE, labels=names(tmp), cex.axis=.7, gap=3, ylab=c("Pattern of missing data target=1","Pattern"))
+
+rm(missing_tgt1, tmp)
+```
+
+We looked at the cross-tabulation of v30 and v113 with two numeric features v112 and v8 to see if there is a specific categorical value coded when the numeric values are missing.There doesn't appear to be one as there are missing and non-missing numeric values for all categories. 
+
+```{r, fig.align="center", fig.height=12, fig.width=20, message=FALSE}
+#Visualise v30 and v113 with the numeric variables
+feature.names <- t(select(filter(missing_num, pct_Miss > 0.4),feature.names))
+feature.names <- c("v30", "v113", feature.names)
+tmp <- train[feature.names]
+aggr(tmp, col=c('light blue','red'), numbers=TRUE, combined=TRUE, sortVars=TRUE, labels=names(tmp), cex.axis=.7, gap=3, ylab=c("Pattern of missing data","Pattern"))
+
+#md <- md.pattern(tmp)
+#md <- data.frame(obs=as.numeric(rownames(md)),md) %>% 
+#    arrange(-obs) 
+#filter(md, obs > 1000 | is.na(obs))
+#md.pairs(tmp)$mm
+
+#Proportion of missingess by categorical values
+feature.names <- c("v30","v113","v102","v8")
+tmp <- train[feature.names]
+tmp <- tmp %>% mutate(v30=ifelse(is.na(v30),'99',v30), 
+                     v113=ifelse(is.na(v113),'99',v113),
+                    miss102=ifelse(is.na(v102),1,0),
+                     miss8=ifelse(is.na(v8),1,0))
+table(tmp$v30,tmp$miss102)
+table(tmp$v30,tmp$miss8)
+table(tmp$v113,tmp$miss102)
+table(tmp$v113,tmp$miss8)
+#prop.table(table(tmp$v30,tmp$v113))
+
+rm(tmp, feature.names)
+```
+
+###Distribution of the categorical features
+
+Most of the categorical features except perhaps v52 and v107 maybe useful for prediction. We also note that the proportion of target=1 is larger in the missing value category for v30 and v113 than non-missing. Hence the missingness of a categorical variable is predictive. 
+
+For categorical variables, our strategy then is to replace missing category with a new categorical value.
+
+```{r, fig.align="center", fig.height=4, fig.width=20, warning=FALSE}
+
+#Convert target to factor and reverse order
+train_fac$target <- factor(train_fac$target,levels=rev(levels(factor(as.factor(train_fac$target)))))
+
+lvls <- names(level[level <= 50])
+out <- NULL 
+for(i in 1:length(lvls)){
+   df <- train_fac[c("target",lvls[i])]
+   out[[i]] <- ggplot(df, aes_string(colnames(df)[2], 
+               fill = colnames(df)[1])) + geom_bar() 
+}
+
+grid.arrange(out[[1]], out[[2]], out[[3]], ncol = 3)
+grid.arrange(out[[4]], out[[5]], out[[6]], ncol = 3)
+grid.arrange(out[[7]], out[[8]], out[[9]], ncol = 3)
+grid.arrange(out[[10]], out[[11]], out[[12]], ncol = 3)
+grid.arrange(out[[13]], out[[14]], out[[15]], ncol = 3)
+grid.arrange(out[[16]], ncol = 1)
+rm(lvls,out,df,i)
+
+train %>% select(target, v30) %>% 
+  mutate(miss=ifelse(is.na(v30),1,0)) %>% 
+  group_by(miss) %>% 
+  summarize(mean(target))
+
+train %>% select(target, v113) %>% 
+  mutate(miss=ifelse(is.na(v113),1,0)) %>% 
+  group_by(miss) %>% 
+  summarize(mean(target))
+```
+
+###Imputation of Missing Values
+Steps:
+1. v14 - change <0 to 0.
+2. Replace categorical features with integers, and missing value with -1.
+3. Impute missing values for numeric features where proportion of missing values is less than 5%.
+4. Add an indicator for observations without missing values and with missing values. Replace missing values with zero.
+
+```{r}
+#v14 - change values <0 to 0
+train_Imp <- mutate(train, v14=ifelse(v14<0,0,v14)) %>% select(-ID)
+
+#Replace categorical features with integers and missing as -1
+fac <- sapply(train_Imp, is.factor)
+train_Imp[fac] <- lapply(train_Imp[fac],function(x){ifelse(is.na(x),as.integer(-1),as.integer(x))})
+
+#Impute missing values for numeric features v10,v12,v14,v21,v34,v40, v50 and v114
+#Use information for the categorical features as well
+feature.names <- names(select(train_fac,-ID))
+
+feature.names <- c(feature.names, "v10","v12","v14","v21","v34","v40","v50","v114")
+summary(train_Imp[feature.names])
+
+set.seed(12345)
+imputed = complete(mice(train_Imp[feature.names]))
+
+train_Imp[feature.names] = imputed[feature.names]
+#check that they are not missing anymore
+summary(train_Imp[feature.names])
+
+#Add indicator for each feature to indicate observation with missing value, and complete cases
+feature.names <- names(select(train_num,-ID))
+tmp <- data.frame(vComplete = as.integer(complete.cases(train_Imp))) 
+train_Imp <- bind_cols(train_Imp, tmp) 
+
+feature.names <- names(select(train_num,-c(ID,target,v10,v12,v14,v21,v34,v40,v50,v114)))
+for(i in 1:length(feature.names)) {
+    train_Imp[[paste(feature.names[i],"Miss", sep="_")]] <- apply(train_Imp[feature.names[i]],2,function(x){ifelse(is.na(x),1,0)})
+
+}
+#Change missing value to 0.
+train_Imp[feature.names] <- lapply(train_Imp[feature.names], function(x){ifelse(is.na(x),0,x)})
+
+rm(imputed, fac, tmp, feature.names,i)
+
+```
+
+###Corrrelation
+
+We look at the association between the categorical features (pairwise only) and the correlation between the numeric featuress to see if we can reduce some of the features.
+We want features which are independent from each other but which the target variable is dependent on.
+
+We meassure the strength of the associations for the categorical features using Cramer-V statistics from the *vcd* package. There were a number of pairwise features with high association (>0.7). We have perfect relationship between v47 and v110, v79 and v110, v91 and v107. A cross tabulation of the features indicate that one of the features carry the same information. We drop variables v110, v107 as they are redundant.
+
+Some of the categorical values have low counts. We recode the values to the value with the highest count. 
+
+```{r}
+out = data.frame(var1=character(), 
+                 var2=character(), 
+                 cramerV=double())
+
+#Exclude features with high number of factors
+feature.names <- names(select(train_fac,-c(ID,v22,v56,v125)))
+tmp <- train_Imp[feature.names] 
+
+for(i in 1:ncol(tmp)){
+  for(j in 1:ncol(tmp))  
+     if (i != j){
+        tbl <- select(tmp,c(i,j))
+        xtab <- xtabs(~., tbl)
+        newrow = data.frame(var1=names(tmp[,i]), 
+                            var2=names(tmp[,j]),
+                            cramerV=assocstats(xtab)$cramer)
+        out <- rbind(out, newrow)
+    }
+} 
+
+out %>% filter(cramerV > 0.7) %>% arrange(-cramerV)
+
+table(tmp$v47,tmp$v110)   #Drop v110, as give same information. 2 in v110 same as v3
+table(tmp$v79,tmp$v110)   #Drop v110 give same information
+table(tmp$v91,tmp$v107)   #Drop v107 
+table(tmp$v71,tmp$v75)    #3 cells with high counts, Drop v75. Collapse category 1,4,6,7,8,9 of v71 into 5. Low counts
+table(tmp$v47,tmp$v79)    # values for v79 in one category of v47. So can drop v47. Collapse factors with low counts into one - 1,6,7,8,10,12,14,17,18
+
+#Reduce levels for categories with low counts
+train_Imp$v47 <- ifelse(train_Imp$v47 %in% c(8), as.integer(9), train_Imp$v47)
+train_Imp$v52 <- ifelse(train_Imp$v52 %in% c(-1), as.integer(10), train_Imp$v52)
+train_Imp$v71 <- ifelse(train_Imp$v71 %in% c(1,4,6,7,8,9), as.integer(5), train_Imp$v71) 
+train_Imp$v79 <- ifelse(train_Imp$v79 %in% c(1,6,7,8,10,12,14,17,18), as.integer(19), train_Imp$v79)
+train_Imp$v91 <- ifelse(train_Imp$v91 %in% c(-1), as.integer(1), train_Imp$v91)
+train_Imp$v113 <- ifelse(train_Imp$v113 %in% c(2,12,19), as.integer(18), train_Imp$v113)
+
+rm(feature.names, tmp, out)
+```
+
+We use the *corrplot* to visualise the correlation matrix. We firstly looked the correlation between the non-missing numeric features using all the data. From the correlogram, we can see that some of the features are highly correlated.There are 5 pairs of features with the correlations > |0.7|. A plot of a random sample of the data shows some patterns and interesting relationships between the features on the scatter plots. v10 seems to be of some intervals and unusual pattern between v34 and v40, v12 and v50 and v40 and v114.
+
+```{r, fig.align="center", fig.height=6, fig.width=20, warning=FALSE}
+#Correlation between non-missing numeric features
+feature.names <- c("v10","v12","v14","v21","v34","v40","v50","v114")
+tmp <- train_Imp[feature.names]
+cor <- cor(tmp, use="everything")
+col <- colorRampPalette(c("red", "white", "blue"))(10)
+corrplot(cor, type="lower", order="hclust", col=col, tl.cex=1, tl.col="black", tl.srt=0)
+```
+
+```{r, fig.align="center", fig.height=4, fig.width=20, warning=FALSE}
+cor[lower.tri(cor,diag=TRUE)] <- NA
+cor <- as.data.frame(as.table(cor)) 
+cor <- cor %>% 
+          filter(!is.na(Freq)) %>% 
+          arrange(Var1, Var2)
+
+high_cor <- filter(cor, abs(Freq) > 0.7) 
+
+#take random subset of 5000 observations 
+tmp <- train_Imp[c("target",feature.names)] %>% 
+              mutate(target=factor(target)) %>%
+              sample_n(5000) 
+
+#Plot all pairwise features
+out <- NULL
+x <- as.character(cor$Var1)
+y <- as.character(cor$Var2)
+for(i in 1:nrow(cor)){
+   df <- tmp[c("target",x[i],y[i])] 
+   out[[i]] <- ggplot(df, aes_string(x=colnames(df)[2], 
+                                     y=colnames(df)[3],
+                                     fill="target")) +
+                geom_point(cex=3, pch=21)  
+}
+grid.arrange(out[[1]], out[[2]], out[[3]], out[[4]], ncol = 4)
+grid.arrange(out[[5]], out[[6]], out[[7]], out[[8]], ncol = 4)
+grid.arrange(out[[9]], out[[10]], out[[11]], out[[12]], ncol = 4)
+grid.arrange(out[[13]], out[[14]], out[[15]], out[[16]], ncol = 4)
+grid.arrange(out[[17]], out[[18]], out[[19]], out[[20]], ncol = 4)
+grid.arrange(out[[21]], out[[22]], out[[23]], out[[24]], ncol = 4)
+grid.arrange(out[[25]], out[[26]], out[[27]], out[[28]], ncol = 4)
+
+rm(feature.names,tmp,cor,col,high_cor,out,x,y,df)
+```
+
+###PC
+```{r, cache=TRUE}
+#take random subset of 5000 observations ofnumeric !!!!!!
+tmp <- train_Imp[c("target",feature.names)] %>% 
+              mutate(target=factor(target)) %>%
+              sample_n(5000) 
+X <- select(tmp,-target) %>% as.matrix()
+d <- dist(X)
+pc <- prcomp(X)
+summary(pc) 
+#d_approx <- dist(pc$x[,1:3])
+#plot(d, d_approx)
+#abline(0,1, col=2)
+
+data.frame(pc$x[,1:2], target=sample$target) %>% 
+ ggplot(aes(PC1,PC2, fill = factor(target)))+
+ geom_point(cex=3, pch=21) +
+ coord_fixed(ratio = 1)
+
+rm(tmp, X, d, pc)
+```
+
+#Correlation between all numeric features
+
+We looked at the correlation between complete cases. From the correlogram, there are some features that are highly correlated. There is also clusters of features that are positive correlated, but negatively correlated with another group of features. 
+
+There are 61 pairs of features with correlation greater than 0.9. Some of the features are appear numerous times (v25 - 5 times, v8, v29, v33, v46 - 4 times) which suggest that the are linked.
+
+For prediction of the target value, we want to choose numeric features that are correlated with the target but the features are not correlated. 
+
+```{r, fig.align="center", fig.height=4, fig.width=20, message=FALSE}
+# ALL numeric variables
+feature.names <- names(select(train_num,-c(ID,target)))
+tmp <- filter(train_Imp,vComplete == 1)[feature.names] 
+cor <- cor(tmp, use="everything")
+col<- colorRampPalette(c("red", "white", "blue"))(10)
+corrplot(cor, type="lower", order="hclust", method="color", col=col, tl.cex=0.4, tl.col="black", tl.srt=0)
+
+cor[lower.tri(cor,diag=TRUE)] <- NA
+cor <- as.data.frame(as.table(cor)) 
+cor <- cor %>% 
+          filter(!is.na(Freq)) %>% 
+          arrange(Freq)
+
+#correlation greater than 0.9
+high_cor <- filter(cor, abs(Freq) > 0.9)  
+
+#Count number of times a feature is correlated with another
+mutate(high_cor, Freq=1) %>% group_by(Var1) %>% summarise(count=sum(Freq)) %>% filter(count > 1) %>% arrange(-count)
+
+#take random subset of data
+tmp <- train_Imp[c("target","vComplete",feature.names)] %>% 
+            filter(vComplete==1) %>%
+            mutate(target=factor(target)) %>%
+            sample_n(5000) 
+
+#Plot random sample of 28 pairs
+cor <- cor %>% sample_n(28) 
+out <- NULL
+x <- as.character(cor$Var1)
+y <- as.character(cor$Var2)
+for(i in 1:nrow(cor)){
+   df <- tmp[c("target",x[i],y[i])] 
+   out[[i]] <- ggplot(df, aes_string(x=colnames(df)[2], 
+                                     y=colnames(df)[3],
+                                     fill="target")) +
+                geom_point(cex=3, pch=21)  
+}
+grid.arrange(out[[1]], out[[2]], out[[3]], out[[4]], ncol = 4)
+grid.arrange(out[[5]], out[[6]], out[[7]], out[[8]], ncol = 4)
+grid.arrange(out[[9]], out[[10]], out[[11]], out[[12]], ncol = 4)
+grid.arrange(out[[13]], out[[14]], out[[15]], out[[16]], ncol = 4)
+grid.arrange(out[[17]], out[[18]], out[[19]], out[[20]], ncol = 4)
+grid.arrange(out[[21]], out[[22]], out[[23]], out[[24]], ncol = 4)
+grid.arrange(out[[25]], out[[26]], out[[27]], out[[28]], ncol = 4)
+
+#Correlations between Target and numeric variables
+feature.names <- names(select(train_num,-c(ID)))
+tmp <- filter(train_Imp,vComplete == 1)[feature.names] 
+cor <- cor(tmp, use="everything")
+cor[lower.tri(cor,diag=TRUE)] <- NA
+cor <- as.data.frame(as.table(cor)) 
+#Retain correlation over 5%
+cor <- cor %>% 
+          filter(!is.na(Freq), Var1=="target", abs(Freq) > 0.06) %>% arrange(-abs(Freq))
+numeric.features <- as.character(t(cor$Var2))
+
+rm(feature.names,tmp,cor,col,high_cor,out,x,y,df)
+
+```
+
+##Prediction
+
+**1.Baseline Model**
+
+We know from the data that 76.1% of the claims were classified as suitable for accelerated approval. So our baseline model is to simply predict the probability of target = 1 as the proportion of target = 1 in the data. A baseline benchmark scores 0.54441 in the test data set.
+
+```{r}
+#Functiom to evaluate the log loss metric
+logLoss <- function(true_target, pred_prob){
+    -1/length(true_target) * 
+    sum(true_target*log(pred_prob) + (1-true_target)*log(1-(pred_prob)))
+}
+
+#Split into training and test set (80:20)
+set.seed(3234)  # for reproducibility
+inTrain <- createDataPartition(y = train_Imp$target, p=0.8)
+train_set <- slice(train_Imp, inTrain$Resample1)
+test_set <- slice(train_Imp, -inTrain$Resample1)
+
+#1. BaseLine prediction - Mean
+mu <- mean(train_set$target)
+predictions <- rep(mu, nrow(test_set))
+naive_loss<- logLoss(test_set$target, predictions)
+naive_loss
+logLoss_results <- data_frame(Method = "Just the average", logLoss = naive_loss)
+```
+
+**2. Logistic Regression, Model 1**
+
+Logistic regression using features without missing values -categorical variables (excl. v22, v56,v125, v107,v110) and v10,v12,v14,v21,v34,v40, v50 and v114. We improved the logloss to 0.48723.
+
+```{r}
+#Logistic Regression, Model 1
+feature.names <- names(select(train_fac,-c(ID,target,v22,v56, v125,v107,v110)))
+feature.names <- c(feature.names, "v10","v12","v14","v21","v34","v40","v50","v114")
+train_glm <- train_set[c("target",feature.names)]
+test_glm <- test_set[c("target",feature.names)]
+
+glm_fit1 <- glm(target ~., data=train_glm, family="binomial")
+pred1 = predict(glm_fit1, newdata = test_glm, type = "response")
+glm_loss1 <- logLoss(test_glm$target, pred1)
+glm_loss1
+logLoss_results <- bind_rows(logLoss_results,
+                          data_frame(Method="Logit Model 1",  
+                                     logLoss = glm_loss1))
+rm(train_glm, test_glm)
+```
+
+**3. Logistic Regression, Model 2**
+In addition to the features in Model 1, we included additional numeric features we thought might be predictive and added *dummy variable adjustment* for missing values. We improved the logloss slightly to 0.48683.
+
+```{r}
+numeric.features <- c("v2","v4","v28","v36","v44","v54","v61","v63","v64","v81","v87","v100","v106","v98","v119","v123","v129")  
+
+dummy.features = NULL
+for(i in 1:length(numeric.features)) {
+    dummy.features <- c(dummy.features, paste(numeric.features[i],"Miss", sep="_"))
+}  
+feature.names <- unique(c(feature.names, numeric.features, dummy.features))
+
+train_glm <- train_set[c("target",feature.names)]
+test_glm <- test_set[c("target",feature.names)]
+
+glm_fit2 <- glm(target ~., data=train_glm, family="binomial")
+pred2 = predict(glm_fit2, newdata = test_glm, type = "response")
+glm_loss2 <- logLoss(test_glm$target, pred2)
+glm_loss2
+logLoss_results <- bind_rows(logLoss_results,
+                          data_frame(Method="Logit Model 2",  
+                                     logLoss = glm_loss2))
+rm(train_glm, test_glm)
+```
+
+**4. Tree-Based Models**
+a) We use classification trees using the *rpart* package choosing only the features with no missing value as in logistic Model 1. We get a logloss of 0.49737 which is not as good as the logistic model.
+
+```{r}
+library("rpart")
+library("rpart.plot")
+feature.names <- names(select(train_fac,-c(ID,target,v22,v56,v125,v107,v110)))
+feature.names <- c(feature.names,"v10","v12","v14","v21","v34","v40","v50","v114")
+train_cart <- train_set[c("target",feature.names)]
+test_cart <- test_set[c("target",feature.names)]
+
+#Convert categorical features into factor
+feature.names <- names(select(train_fac,-c(ID, v22,v56, v125,v107,v110)))
+train_cart[feature.names] <- lapply(train_cart[feature.names], as.factor)
+test_cart[feature.names] <- lapply(test_cart[feature.names], as.factor)
+
+cart_fit = rpart(target ~ ., data = train_cart,method="class", control = rpart.control(minsplit=30, cp = 0.0005))
+
+# plot the tree 
+rpart.plot(cart_fit, cex=.6)
+printcp(cart_fit)
+plotcp(cart_fit) 
+
+# prune the tree to the cp that minimises the error
+pfit<- prune(cart_fit, cp= cart_fit$cptable[which.min(cart_fit$cptable[,"xerror"]),"CP"]) 
+# plot the pruned tree 
+rpart.plot(pfit, cex=.6)
+
+pred3 = predict(pfit, newdata = test_cart, type = "prob")[,2]
+cart_loss <- logLoss(as.integer(test_cart$target)-1, pred3)
+cart_loss
+logLoss_results <- bind_rows(logLoss_results,
+                          data_frame(Method="Classification Tree",  
+                                     logLoss = cart_loss))
+
+#Cross Validation 
+fitControl = trainControl(method = "cv", number = 10)
+cartGrid = expand.grid( .cp = (1:50)*0.00025) 
+# Perform the cross validation
+tr=train(target ~ ., data = train_cart, method = "rpart", trControl = fitControl, tuneGrid = cartGrid )
+
+# Extract the final parameters
+best.tree = tr$finalModel
+best.tree$cptable
+rpart.plot(best.tree)
+tr$bestTune
+
+# Extract the best tree
+best.tree = tr$finalModel
+tr$bestTune
+rpart.plot(best.tree)
+
+#Refit the model
+cart_fit = rpart(target ~ ., data = train_cart,method="class", control = rpart.control(cp = 0.001))
+
+pred4 = predict(cart_fit, newdata=test_cart, type = "prob")[,2]
+cart_loss <- logLoss(as.integer(test_cart$target)-1, pred4)
+cart_loss
+
+rm(train_cart, test_cart)
+```
+
+b) We repeat the classification tree using random forests. Random forest generates a large number of bootstrapped trees and classifies an observation using each tree in this new "forest". The final predicted outcome is obtained by combining the results across all of the trees.
+
+```{r}
+library("randomForest")
+feature.names <- names(select(train_fac,-c(ID,target,v22,v56,v125,v107,v110)))
+feature.names <- c(feature.names,"v10","v12","v14","v21","v34","v40","v50","v114")
+numeric.features <- c("v2","v4","v28","v36","v44","v54","v61","v63","v64","v81","v87","v100","v106","v98","v119","v123","v129")  
+feature.names <- unique(c(feature.names, numeric.features))
+
+train_rf <- train_set[c("target",feature.names)]
+test_rf <- test_set[c("target",feature.names)]
+
+#Convert categorical features into factor
+feature.names <- names(select(train_fac,-c(ID, v22,v56, v125,v107,v110)))
+train_rf[feature.names] <- lapply(train_rf[feature.names], as.factor)
+test_rf[feature.names] <- lapply(test_rf[feature.names], as.factor)
+
+#Fit the model
+
+rf_fit = randomForest(target ~ ., data = train_rf, ntree=200, importance=TRUE)
+plot(rf_fit)
+varImpPlot(rf_fit, sort=T,main="VariableImportance")
+var.Imp <- data.frame(importance(rf_fit, type=2))
+var.Imp$Variables <- row.names(var.Imp)
+var.Imp[order(var.Imp$MeanDecreaseGini, decreasing=T),]
+
+pred4 = predict(rf_fit, newdata = test_rf, type = "prob")[,2]
+rf_loss <- logLoss(as.integer(test_rf$target)-1, pred4)
+rf_loss
+
+feature.names <- c("v50", "v112", "v113", "v52", "v12", "v10", "v14", "v114", "v34", "v21", "v40", "v79", "v66", "v91", "v47", "v24", "v30", "v31", "v62")
+train_rf <- train_set[c("target",feature.names)]
+test_rf <- test_set[c("target",feature.names)]
+
+#Convert categorical features into factor
+train_rf <- train_rf[c("target",feature.names)]
+test_rf <- train_rf[c("target",feature.names)]
+
+#Fit the model
+rf_fit = randomForest(target ~ ., data = train_rf, ntree=100, importance=TRUE)
+pred4 = predict(rf_fit, newdata = test_rf, type = "prob")[,2]
+rf_loss <- logLoss(as.integer(test_rf$target)-1, pred4)
+rf_loss
+logLoss_results <- bind_rows(logLoss_results,
+                          data_frame(Method="Random Forest",  
+                                     logLoss = rf_loss))
+
+
+#Use all features
+feature.names <- names(select(train,-c(ID,target,v22,v56,v125,v107,v110)))
+train_rf <- train_set[c("target",feature.names)]
+test_rf <- test_set[c("target",feature.names)]
+
+#Convert categorical features into factor
+feature.names <- names(select(train_fac,-c(ID, v22,v56, v125,v107,v110)))
+train_rf[feature.names] <- lapply(train_rf[feature.names], as.factor)
+test_rf[feature.names] <- lapply(test_rf[feature.names], as.factor)
+
+#Fit the model
+rf_fit = randomForest(target ~ ., data = train_rf, ntree=200, importance=TRUE)
+pred4 = predict(rf_fit, newdata = test_rf, type = "prob")[,2]
+rf_loss <- logLoss(as.integer(test_rf$target)-1, pred4)
+rf_loss
+
+```
+
+````{r}
+
+
+library("glmnet")
+age <- c(4,8,7,12,6,9,10,14,7) 
+gender <- c(1,0,1,1,1,0,1,0,0) ; gender<-as.factor(gender)
+bmi_p <- c(0.86,0.45,0.99,0.84,0.85,0.67,0.91,0.29,0.88) 
+m_edu <- c(0,1,1,2,2,3,2,0,1); m_edu<-as.factor(m_edu)
+p_edu <- c(0,2,2,2,2,3,2,0,0); p_edu<-as.factor(p_edu)
+f_color <- c("blue", "blue", "yellow", "red", "red", "yellow", "yellow", "red", "yellow")
+asthma <- c(1,1,0,1,0,0,0,1,1)
+
+f_color <- as.factor(f_color)
+xfactors <- model.matrix(asthma ~ gender + m_edu + p_edu + f_color)[,-1]
+x <- as.matrix(data.frame(age, bmi_p, xfactors))
+
+#note alpha =1 for lasso only and can blend with ridge penalty down to alpha=0 ridge only
+glmmod<-glmnet(x,y=as.factor(asthma),alpha=1,family='binomial')
+
+#plot variable coefficients vs. shrinkage parameter lambda.
+plot(glmmod,xvar="lambda")
+grid()
+
+#convert cat to factor
+
+cv.glmmod <- cv.glmnet(x,y=asthma,alpha=1)
+plot(cv.glmmod)
+best_lambda <- cv.glmmod$lambda.min
+
+best_lambda 
+
+
+
+#KNN, Ddefault k = 5 
+feature.names <- names(select(train_fac,-c(ID,target,v22,v56, v125,v107,v110)))
+feature.names <- c("v10","v12","v14","v21","v34","v40","v50","v114")
+train_knn <- train_set[c("target",feature.names)]
+test_knn <- test_set[c("target",feature.names)]
+
+knn_fit <- knn3(target ~., data=train_knn, prob=TRUE)
+summary(knn_fit)
+pred <- predict(knn_fit, newdata = test_knn, type="prob")[,2]
+knn_loss <- logLoss(test_knn$target, pred)
+knn_loss
+logLoss_results <- bind_rows(logLoss_results,
+                          data_frame(Method="KNN 5",  
+                                     logLoss = knn_loss))
+```
+
