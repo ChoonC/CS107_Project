@@ -18,9 +18,9 @@ ii)	claims for which additional information is required before approval.
 
 The task is to predict the category of a claim based on features available early in the process.
 
-The main motivation for the project is to firstly to explore and gain some insights from the dataset, and secondly to apply machine learning models to predict the outcome. 
+The main motivation for the project is to firstly, explore and gain some insights from the dataset, and secondly to apply machine learning models to predict the outcome. 
 
-The evaluation metric used to assessed model accuracy is **Log Loss**
+The evaluation metric used to assess model accuracy is **Log Loss** defined as 
 
 $$logLoss =-\frac{1}{N}\sum_{i=1}^N (y_{i}logp_{i} + (1-y_{i})log(1-p_{i}))$$
 
@@ -139,7 +139,8 @@ We use the *VIM* package to get a better understanding of the missing data. (ref
 Due to the large proportion of features with missing values, excluding those observations or features would lead to loss of information. We impute the missing values for features where the proportion of missing values is less than 5%, namely v10,v12,v14,v21,v34,v40,v50 and v114. We then add an indicator to the dataset to indicate observations with no missing values and those with missing values. 
 
 ```{r, fig.align="center", fig.height=10, fig.width=20, message=FALSE}
-#Visualise missing datatmp <- select(train_num, -c(ID, target))
+#Visualise missing data
+tmp <- select(train_num, -c(ID, target))
 aggr(tmp, col=c('light blue','red'), numbers=TRUE, combined=TRUE, sortVars=TRUE, labels=names(tmp), cex.axis=.7, gap=3, ylab=c("Pattern of missing data"))
 
 #Target = 1
@@ -464,7 +465,10 @@ tmp <- train_Imp[c("target","vComplete",feature.names)] %>%
             filter(vComplete==1) %>%
             mutate(target=factor(target)) %>%
             sample_n(5000) 
+```
 
+
+```{r, fig.align="center", fig.height=4, fig.width=20, message=FALSE}
 #Plot random sample of 28 pairs
 cor <- cor %>% sample_n(28) 
 out <- NULL
@@ -619,21 +623,21 @@ text(cart_fit, use.n=T, digits=3, cex=0.6)
 pfit<- prune(cart_fit, cp= cart_fit$cptable[which.min(cart_fit$cptable[,"xerror"]),"CP"]) 
 # plot the pruned tree 
 par(mfrow=c(1,1), mar=c(1,1,1,1))
-plot.rpart(pfit, uniform=T, compress=T, margin=0.1, branch=0.3)
+plot(pfit, uniform=T, compress=T, margin=0.1, branch=0.3)
 text(pfit, use.n=T, digits=3, cex=0.6)
 
 pred3 = predict(pfit, newdata = test_cart, type = "prob")[,2]
 cart_loss <- logLoss(as.integer(test_cart$target)-1, pred3)
 cart_loss
 logLoss_results <- bind_rows(logLoss_results,
-                          data_frame(Method="Classification Tree",  
+                          data_frame(Method="Decision Tree",  
                                      logLoss = cart_loss))
 
 rm(train_cart, test_cart)
 
 ```
    
-b) We repeat the classification tree using random forests. Random forest generates a large number of bootstrapped trees and classifies an observation using each tree in this new "forest". Surprising the logloss of 0.49015 loses out to the logistic regression when using the complete case features. This is before performing any parameters tuning. 
+b) We repeat the classification tree using random forests. Random forest generates a large number of bootstrapped trees and classifies an observation using each tree in this new "forest". Surprising the logloss of 0.49015 loses out to the logistic regression when using the complete case features. Additional features did not improve the logLoss. This is before performing any parameters tuning. 
 
 ```{r, warning=FALSE}
 library("randomForest")
@@ -661,45 +665,6 @@ rf_loss
 logLoss_results <- bind_rows(logLoss_results,
                           data_frame(Method="Random Forest",  
                                      logLoss = rf_loss))
-
-#Use all features
-feature.names <- names(select(train_set,-c(target,v22,v56,v125,v107,v110, vComplete)))
-train_rf <- train_set[c("target",feature.names)]
-test_rf <- test_set[c("target",feature.names)]
-
-#Convert categorical features into factor
-feature.names <- names(select(train_fac,-c(ID, v22,v56, v125,v107,v110)))
-train_rf[feature.names] <- lapply(train_rf[feature.names], as.factor)
-test_rf[feature.names] <- lapply(test_rf[feature.names], as.factor)
-
-##Fit the model - this takes a long time!
-#rf_fit = randomForest(target ~ ., data = train_rf, nodesize=250, importance=TRUE)
-#var.Imp[order(var.Imp$MeanDecreaseGini, decreasing=T),]
-
-feature.names <- names(select(train_fac,-c(ID,target,v22,v56,v125,v107,v110)))
-feature.names <- c(feature.names,"v10","v12","v14","v21","v34","v40","v50","v114")
-#We use the top 18 variable importance from the full model and add to the non-missing features.
-important.var <- c("v50", "v113", "v79", "v66", "v47", "v10", "v12", "v31", "v129", "v112", "v14", "v114", "v34", "v62", "v40", "v21", "v24", "v52")
-feature.names <- unique(c(feature.names, important.var))
-
-train_rf <- train_rf[c("target",feature.names)]
-test_rf <- test_rf[c("target",feature.names)]
-
-#Fit the model
-bestmTry <- tuneRF(train_rf[,-1], train_rf$target, stepFactor = 1.5, ntree=200, nodesize=250, improve=1e-5, trace=TRUE, plot=TRUE)
-print(bestmTry)
-
-rf_fit = randomForest(target ~ ., data =train_rf, ntree=200, nodesize=250, mtry=bestmTry, importance=TRUE)
-pred4 = predict(rf_fit, newdata = test_rf, type = "prob")[,2]
-rf_loss <- logLoss(as.integer(test_rf$target)-1, pred4)
-#This is a worst than best case! The problem  I think is because tuneRF assess using OOBError, not the metric we are using
-
-rf_loss
-
-#use caret
-control <- trainControl(method="cv", number=10)
-tunegrid <- expand.grid(.mtry=c(1:15))
-rf <- train(target ~ ., data = train_rf, method="rf", metric="Accuracy", tuneGrid=tunegrid, trControl=control)
 
 
 logLoss_results
